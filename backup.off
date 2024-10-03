@@ -1,0 +1,514 @@
+using System;
+using System.Collections.Generic;
+using System.Data.Odbc;
+using System.Diagnostics;
+using System.IO;
+using NAudio.Wave;
+using NLog;
+using System.Globalization;
+using System.Linq;
+using System.Threading;
+
+
+namespace MusicIndexer
+{
+    public static class DatabaseConfig
+    {
+        // Store the global connection string here
+        public static string ConnectionString = "DSN=dalet51dev;Uid=dalet_admin;Pwd=dalet_admin;";
+    }
+    class Program
+    {
+        private static readonly ILogger logger = LogManager.GetCurrentClassLogger();
+        public static bool VerboseMode = false;  // Global flag for verbose logging
+        private static volatile bool _isLoading;  // Flag to control loading spinner
+
+        // Class to store song info
+        public class SongInfo
+        {
+            public string Title { get; set; }
+            public string Artist { get; set; }
+            public double Duration { get; set; } // Duration in milliseconds (double)
+            public string FilePath { get; set; }
+        }
+
+        static void Main(string[] args)
+        {
+            // Check if verbose mode is enabled
+            if (args.Contains("--verbose"))
+            {
+                VerboseMode = true;
+                Console.WriteLine("Verbose mode enabled.");
+            }
+            // Check for CLI argument
+            if (args.Contains("--cli"))
+            {
+                RunCliMode();
+                return;
+            }
+
+            // Step 1: Ask for the path
+            Console.WriteLine("Please enter the path to your .wav music files:");
+            string musicFolderPath = Console.ReadLine();
+
+            // ConvertAndMoveFiles(musicFolderPath);
+
+            // Step 2: Index .wav files            
+            List<SongInfo> songs = new List<SongInfo>();
+            HashSet<int> existingSoundFileIds = new HashSet<int>();
+            foreach (string filePath in Directory.GetFiles(musicFolderPath, "*.wav"))
+            {
+                try
+                {
+                    // Use NAudio to extract the duration of the wav file
+                    // Convert and move the file using FFmpeg                    
+                    using (var reader = new AudioFileReader(filePath))
+                    {
+                        double durationInMilliseconds = reader.TotalTime.TotalMilliseconds; // Get total duration in milliseconds
+
+                        // Automatically extract artist and title from filename
+                        string fileName = Path.GetFileNameWithoutExtension(filePath);
+                        string[] parts = fileName.Split(" - ", StringSplitOptions.RemoveEmptyEntries);
+
+                        if (parts.Length >= 2)
+                        {
+                            string artist = parts[0].Trim();
+                            string title = parts[1].Trim();
+
+                            // Add song info to the list
+                            songs.Add(new SongInfo
+                            {
+                                Title = title,
+                                Artist = artist,
+                                Duration = durationInMilliseconds, // Store duration as double (in milliseconds)
+                                FilePath = filePath
+                            });
+
+                            Console.WriteLine($"Indexed: {title} by {artist} [{(int)durationInMilliseconds} ms]");
+                            VerboseLog($"File '{filePath}' indexed successfully."); // Verbose logging
+                        }
+                        else
+                        {
+                            Console.WriteLine($"Filename '{fileName}' does not match expected format 'Artist - Title'. Skipping...");
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Failed to index file {filePath}: {ex.Message}");
+                    VerboseLog($"Error processing file '{filePath}': {ex.Message}"); // Verbose logging
+                }
+            }
+        }
+        static int GetNextTitleId(OdbcConnection connection)
+        {
+            int maxId = 0;
+
+            // Get the maximum title_id from the titles table
+            string query = "SELECT MAX(title_id) FROM titles";
+            using (OdbcCommand command = new OdbcCommand(query, connection))
+            {
+                var result = command.ExecuteScalar();
+                if (result != DBNull.Value)
+                {
+                    maxId = Convert.ToInt32(result);
+                }
+            }
+
+            return maxId + 1; // Increment by 1 for the new title_id
+
+        }
+        public static int GetLatestSoundFileId(OdbcConnection connection)
+        {
+            int soundfile_id = 0;
+            // Get the maximum title_id from the titles table
+            string query = "SELECT MAX(soundfile_id) FROM soundfiles";
+            using (OdbcCommand command = new OdbcCommand(query, connection))
+            {
+                var result = command.ExecuteScalar();
+                if (result != DBNull.Value)
+                {
+                    soundfile_id = Convert.ToInt32(result);
+                }
+            }
+            return soundfile_id + 1; // Increment by 1 for the new title_id
+        }
+
+        static void InsertSongsIntoDatabase(List<SongInfo> songs)
+        {
+            // Set culture to en-US or your desired culture
+            CultureInfo culture = new CultureInfo("en-US");
+            Thread.CurrentThread.CurrentCulture = culture;
+            Thread.CurrentThread.CurrentUICulture = culture;
+
+            System.Text.Encoding.RegisterProvider(System.Text.CodePagesEncodingProvider.Instance);
+
+            logger.Info("Attempting to insert songs into the database...");
+
+            string connectionString = "DSN=dalet51dev;Uid=dalet_admin;Pwd=dalet_admin;";
+
+            using (OdbcConnection connection = new OdbcConnection(connectionString))
+            {
+                try
+                {
+                    connection.Open();
+                    logger.Info("Database connection opened successfully.");
+                    Console.WriteLine("Database connection opened successfully."); // Added console output
+
+                    foreach (var song in songs)
+                    {
+                        // Step 1: Check if artist exists
+                        logger.Info($"Checking artist: {song.Artist}");
+                        int artistId = CheckOrCreateArtist(connection, song.Artist);
+                        Console.WriteLine($"Artist ID retrieved: {artistId} for artist: {song.Artist}"); // Added console output
+
+                        // Step 2: Insert title data
+                        logger.Info($"Inserting title data for: {song.Title} by artist ID {artistId}");
+                        InsertTitleData(connection, song, artistId, soundfile_id);
+                        Console.WriteLine($"Inserted title data for: {song.Title}"); // Added console output
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Database error: {ex.Message}");
+                    logger.Error(ex, "Database operation failed.");
+                }
+            }
+            Console.WriteLine("Database insertion process completed."); // Added console output at the end            
+        }
+
+        // Function to check if an artist exists and create them if not        
+        static int CheckOrCreateArtist(OdbcConnection connection, string artistName)
+        {
+            int artistId = 0;
+
+            // Check if the artist exists
+            string checkQuery = "SELECT artist_id FROM artist WHERE name = ?";
+            using (OdbcCommand command = new OdbcCommand(checkQuery, connection))
+            {
+                command.Parameters.AddWithValue("@name", artistName);
+                var result = command.ExecuteScalar();
+
+                if (result != null)
+                {
+                    artistId = Convert.ToInt32(result); // Artist exists, get ID
+                    logger.Info($"Artist found: {artistName} (ID: {artistId})");
+                }
+                else
+                {
+                    // Artist does not exist, create a new one
+                    string maxIdQuery = "SELECT MAX(artist_id) FROM artist WHERE artist_id > 0"; // Get the current maximum artist_id
+                    using (OdbcCommand maxIdCommand = new OdbcCommand(maxIdQuery, connection))
+                    {
+                        var maxIdResult = maxIdCommand.ExecuteScalar();
+                        int newArtistId = 1; // Default value for new artist ID
+
+                        // Check if there are existing IDs
+                        if (maxIdResult != DBNull.Value)
+                        {
+                            newArtistId = Convert.ToInt32(maxIdResult) + 1; // Increment the maximum ID
+                        }
+
+                        // Insert new artist
+                        string insertQuery = "INSERT INTO artist (artist_id, name) VALUES (?, ?)";
+                        using (OdbcCommand insertCommand = new OdbcCommand(insertQuery, connection))
+                        {
+                            insertCommand.Parameters.AddWithValue("@artist_id", newArtistId); // Use the calculated ID
+                            insertCommand.Parameters.AddWithValue("@name", artistName);
+                            insertCommand.ExecuteNonQuery();
+
+                            artistId = newArtistId; // Set the newly created artist ID
+                            logger.Info($"New artist created: {artistName} (artist_id: {artistId})");
+                        }
+                    }
+                }
+            }
+            return artistId;
+        }
+
+        // Function to insert title data into the title table
+        static void InsertTitleData(OdbcConnection connection, SongInfo song, int artistId, int soundfile_id)
+        {
+
+            ConvertAndMoveFiles(connection, musicFolderPath, soundfile_id);
+            // Current date for insertion
+
+            DateTime currentDate = DateTime.Now;
+            DateTime endDate = new DateTime(currentDate.Year, currentDate.Month, 1).AddMonths(1); // First day of next month    
+            DateTime killDate = endDate.AddDays(1); // End date + 1 day
+
+            int newTitleId = GetNextTitleId(connection);
+            int soundfile_id_inc = GetLatestSoundFileId(connection);
+            string FixxedSoundFileId = $"{soundfile_id_inc:D8}.wav";
+
+            string insertQuery = @"
+        INSERT INTO titles (title_id,title_type_id, title_interface_id, title, interpret, client, 
+        duration,  is_online, start_date, end_date, 
+        kill_date, audio_duration, use_manual_duration, soundfile_id, site_origin, 
+        no_overwrite, is_rotational_cart, replacement, access_rights, is_opener, 
+        weight, beats_pm, master_record,
+        package_id, album_id, song_id, day_part_rest_id) 
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+
+            using (OdbcCommand command = new OdbcCommand(insertQuery, connection))
+            {
+                try
+                {
+                    // Set parameters (make sure you have the correct number of parameters)
+                    command.Parameters.AddWithValue("@title_id", newTitleId); // Set as needed
+                    command.Parameters.AddWithValue("@title_type_id", 1); // Set as needed
+                    command.Parameters.AddWithValue("@title_interface_id", 1); // Set as needed            
+                    command.Parameters.AddWithValue("@title", song.Title);
+                    command.Parameters.AddWithValue("@interpret", song.Artist); // Use artist ID            
+                    command.Parameters.AddWithValue("@client", song.Artist); // Replace with actual client name as needed
+                    command.Parameters.AddWithValue("@duration", (int)song.Duration); // Duration in milliseconds        
+                    command.Parameters.AddWithValue("@is_online", 1); // True                    
+                    command.Parameters.AddWithValue("@start_date", currentDate); // Inserting DateTime directly
+                    command.Parameters.AddWithValue("@end_date", endDate); // Inserting DateTime directly
+                    command.Parameters.AddWithValue("@kill_date", killDate); // Inserting DateTime directly            
+                    command.Parameters.AddWithValue("@audio_duration", 0);
+                    command.Parameters.AddWithValue("@use_manual_duration", 0); // Set as needed
+                    command.Parameters.AddWithValue("@soundfile_id", soundfile_id_inc); // Adjust as needed                    
+                    command.Parameters.AddWithValue("@site_origin", ""); // Adjust as needed
+                    command.Parameters.AddWithValue("@no_overwrite", 0); // Adjust as needed
+                    command.Parameters.AddWithValue("@is_rotational_cart", 0); // Adjust as needed
+                    command.Parameters.AddWithValue("@replacement", 0); // Adjust as needed
+                    command.Parameters.AddWithValue("@access_rights", "111111111"); // Hardcoded for example
+                    command.Parameters.AddWithValue("@last_words", ""); // Adjust as needed
+                    command.Parameters.AddWithValue("@is_opener", 0); // Adjust as needed
+                    command.Parameters.AddWithValue("@weight", 0); // Adjust as needed
+                    command.Parameters.AddWithValue("@beats_pm", 0); // Adjust as needed
+                    command.Parameters.AddWithValue("@master_record", 0); // Adjust as needed                    
+                    command.Parameters.AddWithValue("@package_id", 0); // Adjust as needed
+                    command.Parameters.AddWithValue("@album_id", 0); // Adjust as needed
+                    command.Parameters.AddWithValue("@song_id", 0); // Adjust as needed
+                    command.Parameters.AddWithValue("@day_part_rest_id", 0); // Adjust as needed
+
+                    // Execute the command
+                    command.ExecuteNonQuery();
+                    Console.WriteLine($"Inserted title: {song.Title} by artist ID {artistId}");
+
+
+                    // Retrieve the last inserted title ID
+                    string lastIdQuery = "SELECT MAX(title_id) FROM titles"; // Assuming 'title_id' is the primary key
+                    int titleId;
+                    using (OdbcCommand lastIdCommand = new OdbcCommand(lastIdQuery, connection))
+                    {
+                        var lastIdResult = lastIdCommand.ExecuteScalar();
+                        titleId = Convert.ToInt32(lastIdResult); // Get new title ID
+                    }
+
+                    // Now insert the title ID into titles_in_class table
+                    string insertInClassQuery = @"
+                INSERT INTO titles_in_class (title_id, class_id, is_primary_class, order_in_class)
+                VALUES (?, ?, ?, ?)";
+
+                    using (OdbcCommand insertInClassCommand = new OdbcCommand(insertInClassQuery, connection))
+                    {
+                        insertInClassCommand.Parameters.AddWithValue("@title_id", titleId);
+                        insertInClassCommand.Parameters.AddWithValue("@class_id", 11); // Hardcoded class_id
+                        insertInClassCommand.Parameters.AddWithValue("@is_primary_class", 1); // Hardcoded is_primary_class
+                        insertInClassCommand.Parameters.AddWithValue("@order_in_class", DBNull.Value); // NULL for order_in_class
+
+                        insertInClassCommand.ExecuteNonQuery();
+                        Console.WriteLine($"Inserted title_id {titleId} into titles_in_class for class_id 11.");
+                    }
+                    // Now insert the soundfile_id into soundfiles table
+                    string insertInSoudnfilesQuery = @"
+                INSERT INTO soundfiles (soundfile_id, soundfile_unit_id,soundfile_name,soundfile_type,last_modif_time)
+                VALUES (?, ?, ?, ?, ?)";
+
+                    using (OdbcCommand insertInSoundfilesCommand = new OdbcCommand(insertInSoudnfilesQuery, connection))
+                    {
+                        insertInSoundfilesCommand.Parameters.AddWithValue("@soundfile_id", soundfile_id_inc);
+                        insertInSoundfilesCommand.Parameters.AddWithValue("@soundfile_unit_id", 1); // Hardcoded class_id
+                        insertInSoundfilesCommand.Parameters.AddWithValue("@soundfile_name", FixxedSoundFileId); // Hardcoded class_id
+                        insertInSoundfilesCommand.Parameters.AddWithValue("@soundfile_type", ""); // Hardcoded is_primary_class
+                        insertInSoundfilesCommand.Parameters.AddWithValue("@last_modif_time", currentDate); // NULL for order_in_class
+
+                        insertInSoundfilesCommand.ExecuteNonQuery();
+                        Console.WriteLine($"Inserted soundfile_id {soundfile_id} into soundfiles for class_id 11.");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error inserting title data: {ex.Message}");
+                }
+            }
+        }
+        static void ConvertAndMoveFiles(OdbcConnection connection, string musicFolderPath)
+        {
+            // Set the path for FFmpeg executable
+            string ffmpegPath = @"C:\Users\Joey\ffmpeg-master-latest-win32-gpl-shared\bin\ffmpeg.exe";
+            string targetDirectory = @"C:\Soundfile-TEST";
+            int soundfile_id = GetLatestSoundFileId(connection);
+
+            // Ensure the target directory exists
+            if (!Directory.Exists(targetDirectory))
+            {
+                Directory.CreateDirectory(targetDirectory);
+            }
+
+            // Get all .mp3 and .wav files in the specified directory
+            string[] audioFiles = Directory.GetFiles(musicFolderPath, "*.*", SearchOption.TopDirectoryOnly)
+                                            .Where(f => f.EndsWith(".mp3", StringComparison.OrdinalIgnoreCase) ||
+                                                         f.EndsWith(".wav", StringComparison.OrdinalIgnoreCase))
+                                            .ToArray();
+
+            int fileCount = 0;
+
+            foreach (var audioFile in audioFiles)
+            {
+                // Increment the counter
+                fileCount++;
+
+                // Exit the loop after processing 10 files
+                if (fileCount > 10)
+                {
+                    Console.WriteLine("Reached limit of 10 files. Exiting...");
+                    break;
+                }
+                soundfile_id++;
+                // Generate the new sound file name based on the original file name
+                string newSoundFileName = $"{soundfile_id:D8}.wav"; // convert to the correct file
+
+                // Set the target file path for the converted file
+                string targetFilePath = Path.Combine(targetDirectory, newSoundFileName);
+
+                // Prepare the FFmpeg command
+                string ffmpegCommand = $"-i \"{audioFile}\" -acodec pcm_s16le -ac 2 -ar 48000 -f wav \"{targetFilePath}\" -y"; // Example command
+
+                // Create a new process to run the command
+                var processStartInfo = new ProcessStartInfo
+                {
+                    FileName = ffmpegPath,
+                    Arguments = ffmpegCommand,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+
+                try
+                {
+                    using (var process = new Process { StartInfo = processStartInfo })
+                    {
+                        // Subscribe to output and error events
+                        process.OutputDataReceived += (sender, e) =>
+                        {
+                            if (!string.IsNullOrEmpty(e.Data))
+                            {
+                                Console.WriteLine(e.Data); // Display standard output
+                            }
+                        };
+
+                        process.ErrorDataReceived += (sender, e) =>
+                        {
+                            if (!string.IsNullOrEmpty(e.Data))
+                            {
+                                Console.WriteLine($"ERROR: {e.Data}"); // Display standard error
+                            }
+                        };
+
+                        // Start the process
+                        process.Start();
+
+                        // Begin reading output and error streams
+                        process.BeginOutputReadLine();
+                        process.BeginErrorReadLine();
+
+                        // Wait for the process to finish
+                        process.WaitForExit();
+
+                        if (process.ExitCode == 0)
+                        {
+                            Console.WriteLine($"File converted and moved to {targetFilePath}");
+                        }
+                        else
+                        {
+                            Console.WriteLine($"Error converting {audioFile}. Exit Code: {process.ExitCode}");
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Exception processing {audioFile}: {ex.Message}");
+                }
+            }
+        }
+        }
+
+        // Function to get the next title ID
+
+
+        // Function for verbose logging
+        private static void VerboseLog(string message)
+        {
+            if (VerboseMode)
+            {
+                Console.WriteLine(message);
+            }
+        }
+        private static void RunCliMode()
+        {
+            string connectionString = "DSN=dalet51dev;Uid=dalet_admin;Pwd=dalet_admin;";
+            using (OdbcConnection connection = new OdbcConnection(connectionString))
+            {
+                try
+                {
+                    connection.Open();
+                    Console.WriteLine("Database connection opened successfully.");
+
+                    // Loop for querying the database
+                    while (true)
+                    {
+                        Console.Write("Enter SQL query (or 'exit' to quit): ");
+                        string query = Console.ReadLine();
+
+                        if (query.Trim().ToLower() == "exit")
+                            break;
+
+                        ExecuteQuery(connection, query);
+                    }
+                }
+
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Database error: {ex.Message}");
+                    logger.Error(ex, "Database operation failed.");
+                }
+            }
+        }
+        static void ExecuteQuery(OdbcConnection connection, string query)
+        {
+            using (OdbcCommand command = new OdbcCommand(query, connection))
+            {
+                try
+                {
+                    if (query.Trim().StartsWith("SELECT", StringComparison.OrdinalIgnoreCase))
+                    {
+                        using (OdbcDataReader reader = command.ExecuteReader())
+                        {
+                            while (reader.Read())
+                            {
+                                for (int i = 0; i < reader.FieldCount; i++)
+                                {
+                                    Console.Write($"{reader[i]}\t");
+                                }
+                                Console.WriteLine();
+                            }
+                        }
+                    }
+                    else
+                    {
+                        int affectedRows = command.ExecuteNonQuery();
+                        Console.WriteLine($"{affectedRows} rows affected.");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Query execution failed: {ex.Message}");
+                    logger.Error(ex, "Query execution failed.");
+                }
+            }
+        }

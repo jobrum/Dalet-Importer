@@ -1,0 +1,64 @@
+private static void RunCliMode()
+{
+    string connectionString = "DSN=dalet51dev;Uid=dalet_admin;Pwd=dalet_admin;";
+    using (OdbcConnection connection = new OdbcConnection(connectionString))
+    {
+        try
+        {
+            connection.Open();
+            Console.WriteLine("Database connection opened successfully.");
+
+            // Loop for querying the database
+            while (true)
+            {
+                Console.Write("Enter SQL query (or 'exit' to quit): ");
+                string query = Console.ReadLine();
+
+                if (query.Trim().ToLower() == "exit")
+                    break;
+
+                ExecuteQuery(connection, query);
+            }
+        }
+
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Database error: {ex.Message}");
+            logger.Error(ex, "Database operation failed.");
+        }
+    }
+}
+static void ExecuteQuery(OdbcConnection connection, string query)
+{
+    using (OdbcCommand command = new OdbcCommand(query, connection))
+    {
+        try
+        {
+            if (query.Trim().StartsWith("SELECT", StringComparison.OrdinalIgnoreCase))
+            {
+                using (OdbcDataReader reader = command.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        for (int i = 0; i < reader.FieldCount; i++)
+                        {
+                            Console.Write($"{reader[i]}\t");
+                        }
+                        Console.WriteLine();
+                    }
+                }
+            }
+            else
+            {
+                int affectedRows = command.ExecuteNonQuery();
+                Console.WriteLine($"{affectedRows} rows affected.");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Query execution failed: {ex.Message}");
+            logger.Error(ex, "Query execution failed.");
+        }
+    }
+}
+    }

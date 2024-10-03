@@ -1,0 +1,11 @@
+{
+  "version": 2,
+  "dgSpecHash": "72Jo8WepvWw=",
+  "success": true,
+  "projectFilePath": "/home/lightsilver/Dalet-Importer/Import-Tool/Import-Tool.csproj",
+  "expectedPackageFiles": [
+    "/home/lightsilver/.nuget/packages/system.data.odbc/8.0.0/system.data.odbc.8.0.0.nupkg.sha512",
+    "/home/lightsilver/.nuget/packages/system.text.encoding.codepages/8.0.0/system.text.encoding.codepages.8.0.0.nupkg.sha512"
+  ],
+  "logs": []
+}
