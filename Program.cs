@@ -56,27 +56,11 @@ namespace MusicIndexer
             Console.WriteLine("Please fill in the audio format mp3/wav etc...");
             string musicExtension = Console.ReadLine();
 
-            using (OdbcConnection connection = new OdbcConnection(DatabaseConfig.ConnectionString))
-            {
-                try
-                {
-                    connection.Open(); // Open the connection
 
-                    // Call the method that converts and moves files
-                    ConvertAndMoveFiles(connection, musicFolderPath,soundfile_id);
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"An error occurred: {ex.Message}");
-                }
-            }
-            // Convert audio function //
-
-            // ConvertAndMoveFiles(musicFolderPath);
-            // Step 2: Index .wav files            
+            // Step 2: Index all audiofiles in directory with specified extension files            
             List<SongInfo> songs = new List<SongInfo>();
             HashSet<int> existingSoundFileIds = new HashSet<int>();
-            foreach (string filePath in Directory.GetFiles(musicFolderPath, "*.", musicExtension))
+            foreach (string filePath in Directory.GetFiles(musicFolderPath, $"*.{musicExtension}"))
             {
                 try
                 {
@@ -131,13 +115,141 @@ namespace MusicIndexer
             }
             Console.WriteLine($"Music index saved to: {indexFilePath}");
 
-            // Step 3: Insert values into the database
-            Console.WriteLine("Attempting to insert songs into the database...");
-            InsertSongsIntoDatabase(songs);
+
+            // Convert audio if database connection is created. 
+            using (OdbcConnection connection = new OdbcConnection(DatabaseConfig.ConnectionString))
+            {
+                try
+                {
+                    connection.Open(); // Open the connection
+
+                    // Call the method that converts and moves files
+                    ConvertAndMoveFiles(connection, musicFolderPath, soundfile_id);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"An error occurred: {ex.Message}");
+                }
+            }
+            // Wait before user input too insert the values into the database 
+            Console.WriteLine("You wanne insert the converted files into the database ? Y/N ? The files will be overwritten the next time you try to insert it if you say no");
+            string userInput = Console.ReadLine();
+            if (userInput.Equals("y", StringComparison.OrdinalIgnoreCase))
+            {
+                Console.WriteLine("Attempting to insert songs into the database...");
+                InsertSongsIntoDatabase(songs);
+            }
+            else
+            {
+                Console.WriteLine("BREAK BYE");
+            }        
+        
         }
-            
+
+        //Convert the files too wave function using ffmpeg and an specifc set of file modication dedicated too the best usecase in my case for dalet 5.1 
+        static void ConvertAndMoveFiles(OdbcConnection connection, string musicFolderPath, int soundfile_id)
+        {
+            // Set the path for FFmpeg executable
+            string ffmpegPath = @"C:\Users\Joey\ffmpeg-master-latest-win32-gpl-shared\bin\ffmpeg.exe";
+            string targetDirectory = @"C:\Soundfile-TEST";
+            int soundfile_id_new = GetLatestSoundFileId(connection);
+
+            // Ensure the target directory exists
+            if (!Directory.Exists(targetDirectory))
+            {
+                Directory.CreateDirectory(targetDirectory);
+            }
+
+            // Get all .mp3 and .wav files in the specified directory
+            string[] audioFiles = Directory.GetFiles(musicFolderPath, "*.*", SearchOption.TopDirectoryOnly)
+                                            .Where(f => f.EndsWith("mp3", StringComparison.OrdinalIgnoreCase) ||
+                                                         f.EndsWith("wav", StringComparison.OrdinalIgnoreCase))
+                                            .ToArray();
+
+            int fileCount = 0;
+
+            foreach (var audioFile in audioFiles)
+            {
+                ;
+                // Increment the counter
+                fileCount++;
+                // Exit the loop after processing 10 files
+                if (fileCount > 1000)
+                {
+                    Console.WriteLine("Reached limit of 100 files. Exiting...");
+                    break;
+                }
+                // Generate the new sound file name based on the original file name
+                string newSoundFileName = $"{soundfile_id_new:D8}.wav"; // convert to the correct file
+
+                // Set the target file path for the converted file
+                string targetFilePath = Path.Combine(targetDirectory, newSoundFileName);
+
+                // Prepare the FFmpeg command
+                // string ffmpegCommand = $"-i \"{audioFile}\" -acodec pcm_s16le -ac 2 -ar 48000 -filter_complex \"acompressor, loudnorm=I=-16:LRA=11:TP=-1.5\" -f wav \"{targetFilePath}\" -y"; // Compress and check loudness of the audio file convert too better standerd 
+                string ffmpegCommand = $"-i \"{audioFile}\" -acodec pcm_s16le -ac 2 -ar 48000 -f wav \"{targetFilePath}\" -y"; // Example command
+
+                soundfile_id_new++;
+                // Create a new process to run the command
+                var processStartInfo = new ProcessStartInfo
+                {
+                    FileName = ffmpegPath,
+                    Arguments = ffmpegCommand,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+
+                try
+                {
+                    using (var process = new Process { StartInfo = processStartInfo })
+                    {
+                        // Subscribe to output and error events
+                        process.OutputDataReceived += (sender, e) =>
+                        {
+                            if (!string.IsNullOrEmpty(e.Data))
+                            {
+                                Console.WriteLine(e.Data); // Display standard output
+                            }
+                        };
+
+                        process.ErrorDataReceived += (sender, e) =>
+                        {
+                            if (!string.IsNullOrEmpty(e.Data))
+                            {
+                                Console.WriteLine($"ERROR: {e.Data}"); // Display standard error
+                            }
+                        };
+
+                        // Start the process
+                        process.Start();
+
+                        // Begin reading output and error streams
+                        process.BeginOutputReadLine();
+                        process.BeginErrorReadLine();
+
+                        // Wait for the process to finish
+                        process.WaitForExit();
+
+                        if (process.ExitCode == 0)
+                        {
+                            Console.WriteLine($"File converted and moved to {targetFilePath}");
+                        }
+                        else
+                        {
+                            Console.WriteLine($"Error converting {audioFile}. Exit Code: {process.ExitCode}");
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Exception processing {audioFile}: {ex.Message}");
+                }
+            }
+        }
         public static int GetLatestSoundFileId(OdbcConnection connection)
-        {            
+        {
             // Get the maximum title_id from the titles table
             int soundfile_id = 0;
             string query = "SELECT MAX(soundfile_id) FROM soundfiles";
@@ -150,7 +262,7 @@ namespace MusicIndexer
                 }
             }
             return soundfile_id + 1; //increment for new id because there is already a 0 in the database it checks the count not the id
-        }        
+        }
         static void InsertSongsIntoDatabase(List<SongInfo> songs)
         {
             // Set culture to en-US or your desired culture
@@ -349,106 +461,6 @@ namespace MusicIndexer
                 catch (Exception ex)
                 {
                     Console.WriteLine($"Error inserting title data: {ex.Message}");
-                }
-            }
-        }
-        static void ConvertAndMoveFiles(OdbcConnection connection, string musicFolderPath, int soundfile_id)
-        {            
-            // Set the path for FFmpeg executable
-            string ffmpegPath = @"C:\Users\Joey\ffmpeg-master-latest-win32-gpl-shared\bin\ffmpeg.exe";
-            string targetDirectory = @"C:\Soundfile-TEST";
-            int soundfile_id_new = GetLatestSoundFileId(connection);
-
-            // Ensure the target directory exists
-            if (!Directory.Exists(targetDirectory))
-            {
-                Directory.CreateDirectory(targetDirectory);
-            }
-
-            // Get all .mp3 and .wav files in the specified directory
-            string[] audioFiles = Directory.GetFiles(musicFolderPath, "*.*", SearchOption.TopDirectoryOnly)
-                                            .Where(f => f.EndsWith(".mp3", StringComparison.OrdinalIgnoreCase) ||
-                                                         f.EndsWith(".wav", StringComparison.OrdinalIgnoreCase))
-                                            .ToArray();
-
-            int fileCount = 0;
-
-            foreach (var audioFile in audioFiles)
-            {                ;
-                // Increment the counter
-                fileCount++;                
-                // Exit the loop after processing 10 files
-                if (fileCount > 100)
-                {
-                    Console.WriteLine("Reached limit of 100 files. Exiting...");
-                    break;
-                }
-                // Generate the new sound file name based on the original file name
-                string newSoundFileName = $"{soundfile_id_new:D8}.wav"; // convert to the correct file
-
-                // Set the target file path for the converted file
-                string targetFilePath = Path.Combine(targetDirectory, newSoundFileName);
-
-                // Prepare the FFmpeg command
-                string ffmpegCommand = $"-i \"{audioFile}\" -acodec pcm_s16le -ac 2 -ar 48000 -filter_complex \"acompressor, loudnorm=I=-16:LRA=11:TP=-1.5\" -f wav \"{targetFilePath}\" -y"; // Compress and check loudness of the audio file convert too better standerd 
-                //string ffmpegCommand = $"-i \"{audioFile}\" -acodec pcm_s16le -ac 2 -ar 48000 -f wav \"{targetFilePath}\" -y"; // Example command
-
-                soundfile_id_new++;
-                // Create a new process to run the command
-                var processStartInfo = new ProcessStartInfo
-                {
-                    FileName = ffmpegPath,
-                    Arguments = ffmpegCommand,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true
-                };
-
-                try
-                {
-                    using (var process = new Process { StartInfo = processStartInfo })
-                    {
-                        // Subscribe to output and error events
-                        process.OutputDataReceived += (sender, e) =>
-                        {
-                            if (!string.IsNullOrEmpty(e.Data))
-                            {
-                                Console.WriteLine(e.Data); // Display standard output
-                            }
-                        };
-
-                        process.ErrorDataReceived += (sender, e) =>
-                        {
-                            if (!string.IsNullOrEmpty(e.Data))
-                            {
-                                Console.WriteLine($"ERROR: {e.Data}"); // Display standard error
-                            }
-                        };
-
-                        // Start the process
-                        process.Start();
-
-                        // Begin reading output and error streams
-                        process.BeginOutputReadLine();
-                        process.BeginErrorReadLine();
-
-                        // Wait for the process to finish
-                        process.WaitForExit();
-
-                        if (process.ExitCode == 0)
-                        {
-                            Console.WriteLine($"File converted and moved to {targetFilePath}");
-                        }
-                        else
-                        {
-                            Console.WriteLine($"Error converting {audioFile}. Exit Code: {process.ExitCode}");
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"Exception processing {audioFile}: {ex.Message}");
                 }
             }
         }
